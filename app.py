@@ -1,5 +1,7 @@
 import os
 import difflib
+import tempfile
+import uuid
 from datetime import datetime, timezone
 
 import streamlit as st
@@ -10,10 +12,25 @@ from mml_generator import generate_mml
 from nl_parser import parse_rule_based, parse_with_groq, IntentParseError
 from db_engine import build_db_from_xml, sync_change_to_db, log_change_to_db, query
 
-DB_PATH = "ran_config.db"
 LOGO_PATH = "vodafone_logo.png"
 
 st.set_page_config(page_title="RAN Config Agent", layout="wide")
+
+# ---------- Streamlit Cloud secrets bridge ----------
+#
+# Locally you set GROQ_API_KEY as a real environment variable. On Streamlit
+# Community Cloud, secrets are provided via st.secrets (backed by a
+# secrets.toml you paste into the app's dashboard), NOT as an env var. This
+# bridges the two so nl_parser.py -- which only knows about os.environ, by
+# design, to keep it Streamlit-independent and usable from chatbot.py too
+# -- works unmodified in both places. Wrapped in try/except because
+# accessing st.secrets when no secrets.toml exists (e.g. local dev with
+# only an env var) raises rather than returning empty.
+try:
+    if "GROQ_API_KEY" not in os.environ and "GROQ_API_KEY" in st.secrets:
+        os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
+except Exception:
+    pass
 
 # ---------- header logo----------
 if os.path.exists(LOGO_PATH):
@@ -34,31 +51,42 @@ def diff_preview(before_text: str, after_text: str) -> str:
     return "".join(lines).rstrip("\n")
 
 
-def load_config(xml_path: str) -> RANConfig:
-    if not os.path.exists(DB_PATH):
-        build_db_from_xml(xml_path, DB_PATH)
+def load_config(xml_path: str, db_path: str) -> RANConfig:
+    if not os.path.exists(db_path):
+        build_db_from_xml(xml_path, db_path)
     return RANConfig(xml_path)
 
 
-def cells_df():
-    return pd.DataFrame(query(DB_PATH, "SELECT * FROM cells"))
+def cells_df(db_path):
+    return pd.DataFrame(query(db_path, "SELECT * FROM cells"))
 
 
-def antennas_df():
-    return pd.DataFrame(query(DB_PATH, "SELECT * FROM antennas"))
+def antennas_df(db_path):
+    return pd.DataFrame(query(db_path, "SELECT * FROM antennas"))
 
 
-def audit_df():
-    return pd.DataFrame(query(DB_PATH, "SELECT * FROM audit_log ORDER BY id DESC"))
+def audit_df(db_path):
+    return pd.DataFrame(query(db_path, "SELECT * FROM audit_log ORDER BY id DESC"))
 
 
 # ---------- session state ----------
-
+#
+# Each browser session gets its own private temp directory, so the XML
+# file and the SQLite DB are never shared between visitors. Locally
+# (single user) this makes no visible difference; deployed, it's what
+# stops two people using the demo at the same time from seeing or
+# overwriting each other's changes.
 if "config" not in st.session_state:
     st.session_state.config = None
     st.session_state.xml_path = None
-    st.session_state.pending = None 
+    st.session_state.pending = None
     st.session_state.uploader_key = 0  # bumped on "clear everything" to force a fresh uploader widget
+    st.session_state.session_dir = os.path.join(
+        tempfile.gettempdir(), "ran_agent_session_" + uuid.uuid4().hex
+    )
+    os.makedirs(st.session_state.session_dir, exist_ok=True)
+
+DB_PATH = os.path.join(st.session_state.session_dir, "ran_config.db")
 
 
 # ---------- sidebar: parsing engine ----------
@@ -91,20 +119,21 @@ uploaded = st.sidebar.file_uploader(
 )
 
 
-if uploaded is not None and uploaded.name != st.session_state.xml_path:
-    xml_path = uploaded.name
+if uploaded is not None and uploaded.name != st.session_state.get("uploaded_filename"):
+    xml_path = os.path.join(st.session_state.session_dir, uploaded.name)
     with open(xml_path, "wb") as f:
         f.write(uploaded.getbuffer())
     if os.path.exists(DB_PATH):
         os.remove(DB_PATH)  # new file -> old DB would be stale, don't reuse it
-    st.session_state.config = load_config(xml_path)
+    st.session_state.config = load_config(xml_path, DB_PATH)
     st.session_state.xml_path = xml_path
+    st.session_state.uploaded_filename = uploaded.name
     st.session_state.pending = None
-    st.sidebar.success(f"Loaded {xml_path} (DB rebuilt)")
+    st.sidebar.success(f"Loaded {uploaded.name} (DB rebuilt)")
 
 if st.session_state.xml_path:
-    st.sidebar.caption(f"Active file: **{st.session_state.xml_path}**")
-    st.sidebar.caption(f"DB: **{DB_PATH}**")
+    st.sidebar.caption(f"Active file: **{st.session_state.uploaded_filename}**")
+    st.sidebar.caption("DB: synced ✔")
 
     st.sidebar.divider()
     st.sidebar.caption(
@@ -130,6 +159,7 @@ if st.session_state.xml_path:
 
         st.session_state.config = None
         st.session_state.xml_path = None
+        st.session_state.uploaded_filename = None
         st.session_state.pending = None
         st.session_state.uploader_key += 1
         st.sidebar.success("Cleared. Upload a file above to start again.")
@@ -203,15 +233,15 @@ with tab_chat:
 
 with tab_config:
     st.subheader("Cells")
-    st.dataframe(cells_df(), width='stretch')
+    st.dataframe(cells_df(DB_PATH), width='stretch')
     st.subheader("Antennas")
-    st.dataframe(antennas_df(), width='stretch')
+    st.dataframe(antennas_df(DB_PATH), width='stretch')
 
 # ---------- Audit Log tab ----------
 
 with tab_audit:
     st.subheader("Change history")
-    df = audit_df()
+    df = audit_df(DB_PATH)
     if df.empty:
         st.caption("No changes confirmed yet.")
     else:
@@ -221,5 +251,5 @@ with tab_audit:
 if st.session_state.xml_path:
     with open(st.session_state.xml_path, "rb") as f:
         st.sidebar.download_button(
-            "⬇ Download current XML", f, file_name=st.session_state.xml_path
+            "⬇ Download current XML", f, file_name=st.session_state.uploaded_filename
         )
