@@ -12,8 +12,6 @@ from mml_generator import generate_mml
 from nl_parser import parse_rule_based, parse_with_groq, IntentParseError
 from db_engine import build_db_from_xml, sync_change_to_db, log_change_to_db, query
 
-LOGO_PATH = "vodafone_logo.png"
-
 st.set_page_config(page_title="RAN Config Agent", layout="wide")
 
 # ---------- Streamlit Cloud secrets bridge ----------
@@ -31,12 +29,6 @@ try:
         os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
 except Exception:
     pass
-
-# ---------- header logo----------
-if os.path.exists(LOGO_PATH):
-    st.image(LOGO_PATH, width=40)
-else:
-    st.caption("📁 Place your logo at vodafone_logo.png to show it here.")
 
 
 # ---------- helpers ----------
